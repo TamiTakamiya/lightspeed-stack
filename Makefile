@@ -11,6 +11,35 @@ PYTHON_REGISTRY = pypi
 CONFIG ?= lightspeed-stack.yaml
 LLAMA_STACK_CONFIG ?= run.yaml
 
+RAG_CONTENT_IMAGE ?= quay.io/ansible/aap-rag-content:latest
+BYOK_RAG_CONTENT_IMAGE ?= quay.io/ansible/aap-byok-example:latest
+
+PROVIDER_VECTOR_DB_ID_FILE ?= "./vector_db/provider_vector_db_id.ind"
+PROVIDER_VECTOR_DB_ID ?= $(shell [ -f $(PROVIDER_VECTOR_DB_ID_FILE) ] && cat $(PROVIDER_VECTOR_DB_ID_FILE))
+$(info PROVIDER_VECTOR_DB_ID is $(PROVIDER_VECTOR_DB_ID))
+
+BYOK_LLAMA_STACK_YAML ?= "./byok_vector_db/llama-stack.yaml"
+BYOK_PROVIDER_VECTOR_DB_ID ?= $(shell sed -n 's/.*vector_store_id: //p' $(BYOK_LLAMA_STACK_YAML) | tr -d '\n')
+$(info BYOK_PROVIDER_VECTOR_DB_ID is $(BYOK_PROVIDER_VECTOR_DB_ID))
+
+OPENAI_INFERENCE_MODEL ?= gpt-4o-mini
+OPENAI_BASE_URL ?= https://api.openai.com/v1
+
+# Container configuration
+LLAMA_STACK_PORT ?= 8080
+CONTAINER_DB_PATH ?= /.llama/data/distributions/ansible-chatbot
+
+# Choose between docker and podman based on what is available
+ifeq (, $(shell which podman))
+	CONTAINER_RUNTIME ?= docker
+	IMAGE_PREFIX ?=
+else
+	CONTAINER_RUNTIME ?= podman
+	IMAGE_PREFIX ?= localhost/
+endif
+
+PLATFORM ?= "linux/amd64"
+
 run: ## Run the service locally
 	uv run src/lightspeed_stack.py -c $(CONFIG)
 
@@ -145,3 +174,57 @@ help: ## Show this help screen
 	@grep -E '^[ a-zA-Z0-9_./-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-33s\033[0m %s\n", $$1, $$2}'
 	@echo ''
+
+setup-vector-db: vector_db/aap_faiss_store.db byok_vector_db/faiss_store.db
+
+vector_db/aap_faiss_store.db:
+	@echo "Setting up vector db and embedding image..."
+	rm -rf ./vector_db ./embeddings_model
+	mkdir -p ./vector_db
+	$(CONTAINER_RUNTIME) run --platform $(PLATFORM) -d --rm --name rag-content $(RAG_CONTENT_IMAGE) sleep infinity
+	$(CONTAINER_RUNTIME) cp rag-content:/rag/llama_stack_vector_db/faiss_store.db.gz ./vector_db/aap_faiss_store.db.gz
+	$(CONTAINER_RUNTIME) cp rag-content:/rag/llama_stack_vector_db/provider_vector_db_id.ind ./vector_db/provider_vector_db_id.ind
+	$(CONTAINER_RUNTIME) cp rag-content:/rag/embeddings_model .
+	$(CONTAINER_RUNTIME) kill rag-content
+	gzip -d ./vector_db/aap_faiss_store.db.gz
+	# this permission changes will allow the container user 1001 to read/write the files
+	# in these directories
+	chmod -R og+rw ./vector_db/
+	chmod -R og+rw ./embeddings_model/
+
+byok_vector_db/faiss_store.db:
+	@echo "Setting up BYOK vector db..."
+	rm -rf ./byok_vector_db
+	mkdir -p ./byok_vector_db
+	$(CONTAINER_RUNTIME) run --platform $(PLATFORM) -d --rm --name rag-content $(BYOK_RAG_CONTENT_IMAGE) sleep infinity
+	$(CONTAINER_RUNTIME) cp rag-content:/rag/vector_db/faiss_store.db.gz ./byok_vector_db/faiss_store.db.gz
+	$(CONTAINER_RUNTIME) cp rag-content:/rag/vector_db/llama-stack.yaml ./byok_vector_db/llama-stack.yaml
+	$(CONTAINER_RUNTIME) kill rag-content
+	gzip -d ./byok_vector_db/faiss_store.db.gz
+	# this permission changes will allow the container user 1001 to read/write the files
+	# in these directories
+	chmod -R og+rw ./byok_vector_db/
+
+run-container:
+	@echo "Running Ansible Chatbot Stack container..."
+	@echo "Using vLLM URL: $(ANSIBLE_CHATBOT_VLLM_URL)"
+	@echo "Using inference model: $(ANSIBLE_CHATBOT_INFERENCE_MODEL)"
+	@mkdir -p ./container_data/distributions/ansible-chatbot
+	@chmod -R og+rw ./container_data 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --platform $(PLATFORM) --security-opt label=disable -it -p $(LLAMA_STACK_PORT):8080 \
+	  -v ./embeddings_model:/.llama/data/embeddings_model \
+	  -v ./vector_db/aap_faiss_store.db:$(CONTAINER_DB_PATH)/aap_faiss_store.db \
+	  -v ./byok_vector_db:/.llama/data/byok/distributions/ansible-chatbot \
+	  -v ./lightspeed-stack-byok.yaml:/.llama/distributions/ansible-chatbot/config/lightspeed-stack.yaml \
+	  -v ./ansible-chatbot-run.yaml:/.llama/distributions/llama-stack/config/ansible-chatbot-run.yaml \
+	  -v ./ansible-chatbot-system-prompt.txt:/.llama/distributions/ansible-chatbot/system-prompts/default.txt \
+	  -v ./container_data/distributions:/.llama/data/distributions \
+	  --env OPENAI_INFERENCE_MODEL=$(OPENAI_INFERENCE_MODEL) \
+	  --env OPENAI_API_KEY=$(OPENAI_API_KEY) \
+	  --env OPENAI_BASE_URL=$(OPENAI_BASE_URL) \
+	  --env PROVIDER_VECTOR_DB_ID=$(PROVIDER_VECTOR_DB_ID) \
+	  --env OTEL_SDK_DISABLED=true \
+	  --env LLAMA_STACK_LOGGING="all=info" \
+	  --env BYOK_PROVIDER_VECTOR_DB_ID=$(BYOK_PROVIDER_VECTOR_DB_ID) \
+	  quay.io/lightspeed-core/lightspeed-stack:latest \
+	    --config /.llama/distributions/ansible-chatbot/config/lightspeed-stack.yaml

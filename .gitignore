@@ -188,6 +188,10 @@ dev-tools/mcp-mock-server/.certs/
 
 # Llama related - when running the stack as lib client
 .llama
+container_data/
+vector_db/
+byok_vector_db/
+embeddings_model/
 
 # Database files
 *.sqlite
